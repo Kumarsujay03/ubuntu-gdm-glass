@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# gdm-glass — give the Ubuntu GDM login screen a glass-like look with one command.
+# https://github.com/Kumarsujay03/ubuntu-gdm-glass  (MIT License)
+#
+# Usage:
+#   gdm-glass apply [--opacity 0.08] [--radius 12] [--clock 12h|24h]   Apply the glass look
+#   gdm-glass remove                                                    Remove the glass look only
+#   gdm-glass undo                                                      Go back to the previous login screen
+#   gdm-glass reset                                                     Restore the original login screen
+#   gdm-glass status                                                    Show current state and backups
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# GDM's theme is selected through the alternatives system; follow it to the real file.
+RESOURCE="$(readlink -f /usr/share/gnome-shell/gdm-theme.gresource 2>/dev/null || true)"
+[[ -f "$RESOURCE" ]] || RESOURCE="/usr/share/gnome-shell/theme/Yaru/gnome-shell-theme.gresource"
+
+ORIGINAL="$RESOURCE.gdm-glass-original"   # pristine copy, taken once, never overwritten
+PREVIOUS="$RESOURCE.gdm-glass-previous"   # state before the last change (for undo)
+CLOCK_FILE="/etc/dconf/db/gdm.d/90-gdm-glass-clock"
+PREFIX="/org/gnome/shell/theme"
+BEGIN_MARK="/* >>> gdm-glass >>> */"
+END_MARK="/* <<< gdm-glass <<< */"
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+usage() {
+    sed -n '5,10p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+declare -A PKG=([gresource]=libglib2.0-bin [glib-compile-resources]=libglib2.0-dev-bin [dconf]=dconf-cli)
+need() {
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required. Install it with: sudo apt install ${PKG[$cmd]:-$cmd}"
+    done
+}
+
+confirm() {
+    read -r -p "$1 [y/N] " answer
+    [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+ensure_original_backup() {
+    if ! sudo test -f "$ORIGINAL"; then
+        info "First run: saving original theme to $ORIGINAL"
+        sudo cp -a "$RESOURCE" "$ORIGINAL"
+    fi
+}
+
+glass_css() {
+    local opacity="$1" radius="$2"
+    cat <<CSS
+/* Glass user list: translucent, no orange focus border */
+.login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item,
+.login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item:selected,
+.login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item:focus,
+.login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item:hover {
+    background-color: rgba(255, 255, 255, $opacity) !important;
+    box-shadow: none !important;
+    border: none !important;
+    border-radius: ${radius}px !important;
+}
+
+/* Glass password field */
+.login-dialog StEntry,
+.login-dialog StEntry:focus,
+.login-dialog .login-dialog-prompt-entry,
+.login-dialog .login-dialog-prompt-entry:focus {
+    background-color: rgba(255, 255, 255, $opacity) !important;
+    border: none !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+    border-radius: ${radius}px !important;
+}
+
+/* Glass "Not listed?" button */
+.login-dialog-not-listed-button,
+.login-dialog-not-listed-button:hover,
+.login-dialog-not-listed-button:focus,
+.login-dialog-not-listed-button:active {
+    background-color: rgba(255, 255, 255, $opacity) !important;
+    color: #f2f2f2 !important;
+    border: none !important;
+    box-shadow: none !important;
+    border-radius: ${radius}px !important;
+}
+
+/* Transparent back button */
+.login-dialog .cancel-button,
+.login-dialog .cancel-button:hover,
+.login-dialog .cancel-button:focus,
+.login-dialog .cancel-button:active,
+.login-dialog .cancel-button:checked {
+    background-color: transparent !important;
+    background-image: none !important;
+    border: none !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+}
+.login-dialog .cancel-button StIcon {
+    color: #f2f2f2 !important;
+}
+CSS
+}
+
+# rebuild_theme <css-to-append-or-empty>
+# Extracts the current theme, removes any previous gdm-glass block, appends the
+# given CSS (if any), recompiles and installs it. The previous theme is kept for undo.
+rebuild_theme() {
+    local css="$1"
+    need gresource glib-compile-resources
+
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+
+    info "Extracting current GDM theme"
+    local src="$tmp/src" xml="$tmp/theme.gresource.xml" path rel
+    mkdir -p "$src"
+    {
+        echo '<?xml version="1.0" encoding="UTF-8"?>'
+        echo "<gresources><gresource prefix=\"$PREFIX\">"
+        while read -r path; do
+            rel="${path#"$PREFIX"/}"
+            mkdir -p "$src/$(dirname "$rel")"
+            gresource extract "$RESOURCE" "$path" > "$src/$rel"
+            echo "<file>$rel</file>"
+        done < <(gresource list "$RESOURCE")
+        echo "</gresource></gresources>"
+    } > "$xml"
+    [[ -f "$src/gdm.css" ]] || die "This theme has no gdm.css; unsupported layout."
+
+    info "Patching gdm.css"
+    # Remove any block from a previous run, then append a fresh one (last rule wins).
+    sed -i "\|^/\* >>> gdm-glass >>> \*/\$|,\|^/\* <<< gdm-glass <<< \*/\$|d" "$src/gdm.css"
+    if [[ -n "$css" ]]; then
+        printf '\n%s\n%s\n%s\n' "$BEGIN_MARK" "$css" "$END_MARK" >> "$src/gdm.css"
+    fi
+
+    info "Compiling new theme"
+    glib-compile-resources "$xml" --sourcedir="$src" --target="$tmp/new.gresource"
+    [[ -s "$tmp/new.gresource" ]] || die "Compiled theme is empty; nothing was changed."
+
+    info "Installing (previous state saved for 'undo')"
+    sudo cp -a "$RESOURCE" "$PREVIOUS"
+    sudo install -m 644 "$tmp/new.gresource" "$RESOURCE"
+}
+
+set_clock() {
+    need dconf
+    info "Setting login screen clock to $1"
+    printf '[org/gnome/desktop/interface]\nclock-format='"'%s'"'\n' "$1" \
+        | sudo tee "$CLOCK_FILE" >/dev/null
+    sudo dconf update
+}
+
+cmd_apply() {
+    local opacity="0.08" radius="12" clock=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --opacity) opacity="${2:-}"; shift 2 ;;
+            --radius)  radius="${2:-}"; shift 2 ;;
+            --clock)   clock="${2:-}"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    [[ "$opacity" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || die "--opacity must be between 0 and 1 (e.g. 0.08)."
+    [[ "$radius" =~ ^[0-9]{1,2}$ ]] || die "--radius must be a whole number of pixels (0-99)."
+    [[ -z "$clock" || "$clock" == 12h || "$clock" == 24h ]] || die "--clock must be 12h or 24h."
+
+    sudo -v
+    ensure_original_backup
+    rebuild_theme "$(glass_css "$opacity" "$radius")"
+    [[ -n "$clock" ]] && set_clock "$clock"
+
+    echo
+    echo "Done! Log out or reboot to see your glass login screen."
+    echo "Changed your mind? Run: gdm-glass undo"
+}
+
+cmd_remove() {
+    sudo -v
+    rebuild_theme ""
+    if sudo test -f "$CLOCK_FILE"; then
+        sudo rm -f "$CLOCK_FILE"
+        sudo dconf update
+    fi
+    echo "Glass look removed (other customizations kept). Log out or reboot to apply."
+}
+
+cmd_undo() {
+    sudo test -f "$PREVIOUS" || die "Nothing to undo."
+    confirm "Restore the login screen from before the last change?" || { echo "Cancelled."; exit 0; }
+    sudo install -m 644 "$PREVIOUS" "$RESOURCE"
+    echo "Previous login screen restored. Log out or reboot to apply."
+}
+
+cmd_reset() {
+    if sudo test -f "$ORIGINAL"; then
+        confirm "Restore the login screen from before gdm-glass was first used?" || { echo "Cancelled."; exit 0; }
+        sudo install -m 644 "$ORIGINAL" "$RESOURCE"
+    else
+        confirm "No backup found. Reinstall the stock theme package instead?" || { echo "Cancelled."; exit 0; }
+        sudo apt-get install --reinstall -y "$(dpkg -S "$RESOURCE" | cut -d: -f1)"
+    fi
+    if sudo test -f "$CLOCK_FILE"; then
+        sudo rm -f "$CLOCK_FILE"
+        sudo dconf update
+    fi
+    echo "Original login screen restored. Log out or reboot to apply."
+}
+
+cmd_status() {
+    echo "gdm-glass $VERSION"
+    echo "GDM theme:  $RESOURCE"
+    local css
+    css="$(gresource extract "$RESOURCE" "$PREFIX/gdm.css" 2>/dev/null || true)"
+    if grep -qF "$BEGIN_MARK" <<<"$css"; then
+        local opacity
+        opacity="$(sed -n "\|>>> gdm-glass >>>|,\|<<< gdm-glass <<<|p" <<<"$css" \
+            | grep -oE 'rgba\(255, 255, 255, [0-9.]+\)' | head -1 | grep -oE '[0-9.]+\)$' | tr -d ')')"
+        echo "Glass:      on (opacity $opacity)"
+    else
+        echo "Glass:      off"
+    fi
+    if [[ -f "$CLOCK_FILE" ]]; then
+        echo "Clock:      $(grep -oE "'[0-9]+h'" "$CLOCK_FILE" | tr -d "'") (set by gdm-glass)"
+    else
+        echo "Clock:      system default"
+    fi
+    sudo test -f "$ORIGINAL" && echo "Original:   $ORIGINAL" || echo "Original:   (not yet saved)"
+    sudo test -f "$PREVIOUS" && echo "Undo:       available" || echo "Undo:       not available"
+}
+
+case "${1:-}" in
+    apply)   shift; cmd_apply "$@" ;;
+    remove)  cmd_remove ;;
+    undo)    cmd_undo ;;
+    reset)   cmd_reset ;;
+    status)  cmd_status ;;
+    -v|--version) echo "gdm-glass $VERSION" ;;
+    -h|--help|help|"") usage ;;
+    *) usage; exit 1 ;;
+esac

@@ -1,5 +1,7 @@
 # ubuntu-gdm-glass
 
+<p align="center"><img src="docs/banner.png" alt="gdm-glass banner" width="100%"></p>
+
 Give the **Ubuntu login screen (GDM)** a modern **glass-like look** with one command.
 
 ```bash
